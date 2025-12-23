@@ -2,6 +2,7 @@
 """DeepDock: Iterative docking and selection of molecules using gnina and SPRINT."""
 
 import os
+import sys
 # the default mimalloc is a hog and will get killed by slurm unless you reserve a lot more memory than you need
 os.environ['ARROW_DEFAULT_MEMORY_POOL'] = 'jemalloc'
 
@@ -22,6 +23,9 @@ from ultrafast.model import DrugTargetCoembeddingLightning
 from ultrafast.utils import get_featurizer
 import torch.nn.functional as F
 import os
+import uuid
+import shutil
+import tempfile
 import logging
 from rdkit import DataStructs
 from rdkit.Chem.rdmolops import RDKFingerprint
@@ -51,7 +55,8 @@ import subprocess
 from pathlib import Path
 from typing import Iterable, Union
 import pickle
-
+from dask.distributed import get_worker
+import pyarrow.dataset as ds
 from dask.distributed import Client, Semaphore, get_client, wait
 from scipy.stats import gaussian_kde
 import argparse
@@ -314,7 +319,7 @@ def initial_select(
     protein_sequence: str,
     sprint_checkpoint: str,
     cluster,
-    iolimit=50,
+    iolimit,
     device: str = 'cpu',
     N: int = 100_000,
 ):
@@ -338,6 +343,7 @@ def initial_select(
     outdir = f"{prefix}/batch0"
     os.makedirs(outdir, exist_ok=True)
 
+
     if not sprint_checkpoint:
         model = None
         T = None
@@ -347,6 +353,10 @@ def initial_select(
         model.eval().to(device)
         featurizer = get_featurizer(model.args.target_featurizer, batch_size=1)
         e = featurizer._transform_single(protein_sequence).to(device)
+
+        # check featurizer output is not all zeros
+        if e.abs().sum().item() == 0:
+            raise ValueError("Error: Target featurizer produced all-zero features.")
         T = model.embed(e.unsqueeze(0), sample_type="target")
 
     def score(D):
@@ -355,21 +365,49 @@ def initial_select(
     with Client(cluster) as client:
         sem = Semaphore(max_leases=iolimit, name=f"Limiter{iolimit}")
 
+        #calculate size for random sampling
+        dataset = ds.dataset(infile)
+        npart = len(list(dataset.get_fragments()))
+        total_rows = sum(f.metadata.num_rows for f in dataset.get_fragments())
+        fraction = N/total_rows
+
         def iter_parquet_batches(fname, batch_size):
+
+            with sem:
+                # Get Dask temporary directory (falls back to system temp if not set)
+                worker = get_worker()
+                tmpdir = worker.local_directory
+                if tmpdir is None:
+                    # Absolute fallback: system temp directory
+                    tmpdir = tempfile.gettempdir()
+
+                # Construct destination path
+                local_name = os.path.basename(fname)
+                tmp_path = os.path.join(tmpdir, f"{uuid.uuid4()}_{local_name}")
+
+                # Copy file if not already present (or you may force overwrite)
+                try:
+                    shutil.copy2(fname, tmp_path)
+                except Exception:
+                    dask_print(f'Failed copy {fname}')
+                    tmp_path = fname
+                
             table = pq.ParquetFile(fname)
             it = table.iter_batches(batch_size=batch_size,use_threads=False,
                                     columns=["smiles", "name", "sprint"])
             i = 0
             while True:
-                with sem:
+                try:
+                    i += 1
+                    batch = next(it)          # I/O happens here
+                except StopIteration:
+                    table.close()
                     try:
-                        i += 1
-                        batch = next(it)          # I/O happens here
-                    except StopIteration:
-                        return
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+                    return
                 df = batch.to_pandas()        
-
-                # semaphore is released *before* the user starts processing the batch
                 yield df
 
         def make_df(fname):
@@ -378,10 +416,14 @@ def initial_select(
                 df_chunk["score"] = df_chunk["sprint"].map(score)
                 dfs.append(df_chunk[["name", "smiles", "score"]])
             df = pd.concat(dfs, ignore_index=True)
-            return df.nlargest(N,"score")
+            sample = df.sample(frac=fraction).copy().assign(score=0)
+            return df.nlargest(N,"score"),sample
 
         def reduce_df(df1, df2):
-            return pd.concat([df1, df2], ignore_index=True).nlargest(N, "score")
+            df1_top, df1_sample = df1
+            df2_top, df2_sample = df2
+            return (pd.concat([df1_top, df2_top], ignore_index=True).nlargest(N, "score"),
+                    pd.concat([df1_sample, df2_sample], ignore_index=True))
         
         if model is None: # no sprinting, just random sample
             df = dd.read_parquet(infile,columns=['name','smiles'],memory_map=True,pre_buffer=False)            
@@ -390,16 +432,12 @@ def initial_select(
             # get top sprint scoring and random sample and checkpoint to disk
             files = glob.glob(f"{infile}/*.parquet")
             b = db.from_sequence(files, npartitions=len(files))
-            topdf = b.map(make_df).fold(reduce_df).compute()
-            
-            #re-read to avoid keeping stuff in memory
-            df = dd.read_parquet(infile,columns=['name','smiles'],memory_map=True,pre_buffer=False)
-            rand = df.sample(N / len(df)).assign(score=0).compute()
+            topdf,rand = b.map(make_df).fold(reduce_df).compute()
             combined = pd.concat([topdf, rand])
 
         combined = combined.drop_duplicates("smiles")
 
-        npart = min(2 * N // 10, df.npartitions)
+        npart = min(2 * N // 10, npart)
         combined = dd.from_pandas(combined, npart)
 
         combined.to_parquet(
@@ -684,7 +722,7 @@ def plot_dists_by_batch(
             mdf = selected.merge(docked, on="smiles", how="inner")
 
             if n == 0:
-                add_vals(mdf[mdf['score'] > 0], "SPRINT")
+                add_vals(mdf[mdf['score'] != 0], "SPRINT")
                 add_vals(mdf[mdf['score'] == 0], "Random")
             else:
                 add_vals(mdf, f'Batch{n}')
@@ -1046,11 +1084,15 @@ if __name__ == "__main__":
                 else:
                     # Treat provided value as the raw sequence string
                     seq = args.target_sequence
-
-            nseq = seq.replace(r'[^A-Za-z]', '')
+            
+            nseq = re.sub(r'[^A-Za-z]', '',seq)
             if seq != nseq:
-                print("Warning: Non-alphabetic characters removed from target sequence.")
-                seq = nseq
+                print("Error: Non-alphabetic characters in target sequence:")
+                print(seq);
+                sys.exit(-1)
+
+            if args.iolimit < args.max_workers:
+                cluster.adapt(minimum=0,maximum=args.iolimit)
             initial_select(
                 infile=args.input,
                 prefix=args.dir,
@@ -1060,6 +1102,8 @@ if __name__ == "__main__":
                 iolimit=args.iolimit,
                 N=args.batch_size,
             )
+            cluster.adapt(minimum=0, maximum=args.max_workers)
+
 
     if args.command == 'select_batch' or args.command == 'next_batch':
         if args.batch < 0:

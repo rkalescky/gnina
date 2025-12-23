@@ -5,7 +5,7 @@ jobqueue:
     queue: "dept_cpu,dept_gpu,bahar_gpu"
     cores: 4              # total cores per job (= per worker)
     processes: 1           # 1 process per job
-    memory: "5GB"         # Dask worker memory limit, split between processes
+    memory: "4GB"         # Dask worker memory limit, split between processes
     walltime: "72:00:00"
     local-directory: "/scr/"
 
@@ -15,7 +15,7 @@ jobqueue:
       - "--error=/dev/null"
    #   - "--output=slurm_out/%x-%j.out"
    #   - "--error=slurm_out/%x-%j.err" 
-      - "--mem=7GB"
+      - "--mem=1GB"
       # - "--exclude=n033,n034,n037,n038,n039,n040"   # uncomment if you want this
 
     # ---------- Commands run *before* starting dask-worker ----------
@@ -24,7 +24,7 @@ jobqueue:
       - "conda activate ultrafast"
       - "module load cuda"
       - "ulimit -n 60000"
-
+      - "export ARROW_DEFAULT_MEMORY_POOL=jemalloc"  
     # ---------- Extra args to dask-worker (exactly your worker_extra_args) ----------
     worker-extra-args:
       - "--lifetime"
