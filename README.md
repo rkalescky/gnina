@@ -176,6 +176,29 @@ To minimize and score ligands `ligs.sdf` already positioned in a binding site:
 gnina -r rec.pdb -l ligs.sdf --minimize -o minimized.sdf.gz
 ```
 
+Daemon protocol
+===============
+
+GNINA supports a simple line protocol over stdin/stdout via `--daemon_protocol`.
+In daemon mode, stdout is reserved for protocol messages:
+
+- startup: `DAEMON\tREADY`
+- request header: `JOBDATA <job_id> sdf <payload_len>`
+- request body: exactly `<payload_len>` bytes of SDF payload, then a trailing newline
+- success response: `DAEMON\tDONE\t<job_id>\t<enqueued>\t<affinity>\t<cnnscore>\t<cnnaffinity>`
+- error response: `DAEMON\tERROR\t<job_id>\t<message>`
+- shutdown command: `QUIT`
+
+Example:
+```bash
+gnina --receptor rec.pdb --score_only --daemon_protocol --quiet
+```
+
+Protocol notes:
+- payload format is currently `sdf` only;
+- one request is processed at a time per daemon process;
+- non-protocol diagnostics should be emitted on stderr.
+
 To covalently dock a pyrazole to a specific iron atom on the receptor with the bond formed between a nitrogen of the pyrazole and the iron.
 ```
 gnina  -r rec.pdb.gz -l conformer.sdf.gz --autobox_ligand bindingsite.sdf.gz --covalent_rec_atom A:601:FE --covalent_lig_atom_pattern '[$(n1nccc1)]' -o output.sdf.gz 

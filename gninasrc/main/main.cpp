@@ -18,6 +18,7 @@
 #include <boost/unordered_map.hpp>
 #include <boost/unordered_set.hpp>
 #include <cmath> // for ceila
+#include <cstdio>
 #include <exception>
 #include <iostream>
 #include <iterator>
@@ -25,8 +26,11 @@
 #include <openbabel/mol.h>
 #include <openbabel/obconversion.h>
 #include <openbabel/parsmart.h>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <torch/torch.h>
+#include <unistd.h>
 #include <vector> // ligand paths
 
 #include "array3d.h"
@@ -87,6 +91,77 @@ std::string default_output(const std::string &input_name) {
     tmp.resize(tmp.size() - 6); // FIXME?
   return tmp + "_out.pdbqt";
 }
+
+namespace {
+struct daemon_job {
+  std::string job_id;
+  std::string format;
+  size_t payload_len = 0;
+};
+
+bool parse_daemon_job_header(const std::string &line, daemon_job &job, std::string &err) {
+  std::istringstream iss(line);
+  std::string cmd;
+  if (!(iss >> cmd) || cmd != "JOBDATA") {
+    err = "expected 'JOBDATA <job_id> sdf <payload_len>'";
+    return false;
+  }
+  if (!(iss >> job.job_id) || job.job_id.empty()) {
+    err = "missing job_id";
+    return false;
+  }
+  if (!(iss >> job.format) || job.format != "sdf") {
+    err = "unsupported payload format (expected sdf)";
+    return false;
+  }
+  if (!(iss >> job.payload_len)) {
+    err = "missing payload_len";
+    return false;
+  }
+  std::string trailing;
+  if (iss >> trailing) {
+    err = "unexpected extra tokens in JOBDATA header";
+    return false;
+  }
+  return true;
+}
+
+bool read_daemon_payload(std::istream &in, size_t payload_len, std::string &payload, std::string &err) {
+  payload.assign(payload_len, '\0');
+  if (payload_len > 0) {
+    in.read(&payload[0], static_cast<std::streamsize>(payload_len));
+    if (in.gcount() != static_cast<std::streamsize>(payload_len)) {
+      err = "unexpected EOF while reading JOBDATA payload";
+      return false;
+    }
+  }
+  int trailing = in.get();
+  if (trailing == std::char_traits<char>::eof()) {
+    err = "missing trailing newline after JOBDATA payload";
+    return false;
+  }
+  if (static_cast<char>(trailing) != '\n') {
+    err = "expected trailing newline after JOBDATA payload";
+    return false;
+  }
+  return true;
+}
+
+std::string write_daemon_temp_sdf(const std::string &payload) {
+  char path[] = "/tmp/gnina_daemon_XXXXXX.sdf";
+  int fd = mkstemps(path, 4);
+  if (fd < 0) {
+    throw std::runtime_error("failed to create temporary sdf file");
+  }
+  ssize_t wrote = ::write(fd, payload.data(), payload.size());
+  close(fd);
+  if (wrote != static_cast<ssize_t>(payload.size())) {
+    unlink(path);
+    throw std::runtime_error("failed to write full JOBDATA payload to temporary sdf file");
+  }
+  return std::string(path);
+}
+} // namespace
 
 void write_all_output(model &m, const output_container &out, sz how_many, std::ostream &outstream) {
   if (out.size() < how_many)
@@ -897,6 +972,7 @@ Thank you!\n";
     bool flex_hydrogens = false;
     bool print_terms = false;
     bool print_atom_types = false;
+    bool daemon_protocol = false;
     bool add_hydrogens = true;
     bool strip_hydrogens = false;
     bool full_flex_output = false;
@@ -1054,7 +1130,9 @@ Thank you!\n";
         "stripH", value<bool>(&strip_hydrogens),
         "remove polar hydrogens from molecule _after_ performing atom typing for efficiency (off by default - nonpolar are always removed)")(
         "device", value<int>(&settings.device)->default_value(0),
-        "GPU device to use")("no_gpu", bool_switch(&settings.no_gpu), "Disable GPU acceleration, even if available.");
+        "GPU device to use")("no_gpu", bool_switch(&settings.no_gpu), "Disable GPU acceleration, even if available.")(
+        "daemon_protocol", bool_switch(&daemon_protocol)->default_value(false),
+        "Use line protocol over stdin/stdout: JOBDATA/DAEMON READY-DONE/QUIT.");
 
     options_description config("Configuration file (optional)");
     config.add_options()("config", value<std::string>(&config_name), "the above options can be put here");
@@ -1120,6 +1198,12 @@ Thank you!\n";
     if (version) {
       std::cout << version_string << '\n';
       return 0;
+    }
+
+    if (daemon_protocol) {
+      // Keep stdout reserved for protocol lines in daemon mode.
+      quiet = true;
+      settings.verbosity = 0;
     }
 
     tee log(quiet);
@@ -1216,12 +1300,12 @@ Thank you!\n";
     }
 
     if (ligand_names.size() == 0) {
-      if (!settings.no_lig) {
+      if (!settings.no_lig && !daemon_protocol) {
         std::cerr << "Missing ligand.\n"
                   << "\nCorrect usage:\n"
                   << desc_simple << '\n';
         return 1;
-      } else // put in "fake" ligand
+      } else if (!daemon_protocol) // put in "fake" ligand
       {
         ligand_names.push_back("");
       }
@@ -1423,6 +1507,108 @@ Thank you!\n";
       dl_scorer = std::make_shared<CNNTorchScorer<true>>(cnnopts, &log);
     else
       dl_scorer = std::make_shared<CNNTorchScorer<false>>(cnnopts, &log);
+
+    if (daemon_protocol) {
+      auto score_daemon_payload = [&](const std::string &payload, fl &affinity, fl &cnnscore, fl &cnnaffinity) {
+        std::string tmp_path = write_daemon_temp_sdf(payload);
+        struct cout_redirect_guard {
+          explicit cout_redirect_guard(std::streambuf *replacement) : old(std::cout.rdbuf(replacement)) {}
+          ~cout_redirect_guard() { std::cout.rdbuf(old); }
+          std::streambuf *old;
+        };
+
+        try {
+          std::ostringstream sink;
+          cout_redirect_guard guard(sink.rdbuf());
+
+          model m;
+          mols.setInputFile(tmp_path);
+          if (!mols.readMoleculeIntoModel(m)) {
+            throw usage_error("failed to parse sdf payload into molecule");
+          }
+
+          m.set_pose_num(0);
+          m.gdata.device_on = settings.gpu_docking;
+          m.gdata.device_id = settings.device;
+
+          grid_dims gdbox(gd);
+          if (settings.local_only) {
+            gdbox = m.movable_atoms_box(autobox_add, box_granularity);
+            for (unsigned pos = 0; pos < 3; pos++) {
+              if (gdbox.elems[pos].n * box_granularity > 100) {
+                throw usage_error("ligand extent too large for local_only box");
+              }
+            }
+          } else if (autobox_extend && !settings.no_lig) {
+            fl maxdim = m.max_span(0);
+            setup_grid_dims(center_x, center_y, center_z, size_x > maxdim ? size_x : maxdim,
+                            size_y > maxdim ? size_y : maxdim, size_z > maxdim ? size_z : maxdim, gdbox);
+          }
+
+          std::vector<result_info> results;
+          main_procedure(
+              m, *prec, boost::optional<model>(), settings,
+              false, // no_cache
+              atomoutfile.is_open() || settings.include_atom_info, gdbox, minparms, wt, log, results, user_grid,
+              *dl_scorer);
+          if (results.empty()) {
+            throw usage_error("no score results produced");
+          }
+          affinity = results.front().getEnergy();
+          cnnscore = results.front().getCNNScore();
+          cnnaffinity = results.front().getCNNAffinity();
+        } catch (...) {
+          unlink(tmp_path.c_str());
+          throw;
+        }
+        unlink(tmp_path.c_str());
+      };
+
+      std::cout << "DAEMON\tREADY" << std::endl;
+      for (;;) {
+        std::string line;
+        if (!std::getline(std::cin, line)) {
+          break;
+        }
+        if (!line.empty() && line.back() == '\r') {
+          line.pop_back();
+        }
+        if (line.empty()) {
+          continue;
+        }
+        if (line == "QUIT") {
+          std::cout << "DAEMON\tBYE" << std::endl;
+          break;
+        }
+
+        daemon_job job;
+        std::string err;
+        if (!parse_daemon_job_header(line, job, err)) {
+          std::cout << "DAEMON\tERROR\t-\t" << err << std::endl;
+          continue;
+        }
+        std::string payload;
+        if (!read_daemon_payload(std::cin, job.payload_len, payload, err)) {
+          std::cout << "DAEMON\tERROR\t" << job.job_id << "\t" << err << std::endl;
+          continue;
+        }
+
+        try {
+          fl affinity = 0.0;
+          fl cnnscore = 0.0;
+          fl cnnaffinity = 0.0;
+          score_daemon_payload(payload, affinity, cnnscore, cnnaffinity);
+          std::cout << "DAEMON\tDONE\t" << job.job_id << "\t1\t" << affinity << "\t" << cnnscore << "\t"
+                    << cnnaffinity << std::endl;
+        } catch (std::exception &e) {
+          std::string msg = e.what();
+          std::replace(msg.begin(), msg.end(), '\t', ' ');
+          std::replace(msg.begin(), msg.end(), '\n', ' ');
+          std::cout << "DAEMON\tERROR\t" << job.job_id << "\t" << msg << std::endl;
+        }
+      }
+      return 0;
+    }
 
     if (!settings.local_only)
       nthreads = 1; // docking is multithreaded already, don't add additional parallelism other than pipeline

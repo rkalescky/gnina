@@ -160,9 +160,21 @@ if(NOT LIBMOLGRID_LIBRARY)
  include(ExternalProject)
  find_package(Git REQUIRED)
  set(EXTERNAL_INSTALL_LOCATION ${CMAKE_BINARY_DIR}/external)
+ set(LIBMOLGRID_EXTERNAL_CMAKE_ARGS
+    -DCMAKE_INSTALL_PREFIX=${EXTERNAL_INSTALL_LOCATION}
+    -DCMAKE_CXX_FLAGS=-Wno-error=template-id-cdtor
+ )
+ if(DEFINED ENV{CONDA_PREFIX})
+   list(APPEND LIBMOLGRID_EXTERNAL_CMAKE_ARGS
+     -DCMAKE_PREFIX_PATH=$ENV{CONDA_PREFIX}
+     -DOPENBABEL3_INCLUDE_DIR=$ENV{CONDA_PREFIX}/include/openbabel3
+     -DOPENBABEL3_LIBRARIES=$ENV{CONDA_PREFIX}/lib/libopenbabel.so
+   )
+ endif()
  ExternalProject_Add(libmolgrid
     GIT_REPOSITORY https://github.com/gnina/libmolgrid
-    CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${EXTERNAL_INSTALL_LOCATION}
+    PATCH_COMMAND ${CMAKE_COMMAND} -E env bash -lc "cd <SOURCE_DIR> && sed -i \"s/ -Werror//g\" CMakeLists.txt && sed -i \"/add_subdirectory(python)/d\" CMakeLists.txt && sed -i \"/add_subdirectory(docs)/d\" CMakeLists.txt && sed -i \"/add_subdirectory(test)/d\" CMakeLists.txt"
+    CMAKE_ARGS ${LIBMOLGRID_EXTERNAL_CMAKE_ARGS}
   )
   set(LIBMOLGRID_INCLUDE_DIR ${EXTERNAL_INSTALL_LOCATION}/include)
   set(LIBMOLGRID_LIBRARY ${EXTERNAL_INSTALL_LOCATION}/lib/libmolgrid.a)
